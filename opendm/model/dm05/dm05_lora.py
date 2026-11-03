@@ -43,6 +43,41 @@ def _load_dm05_config_for_inference(
     return config
 
 
+def _apply_attention_config_for_inference(
+    config: DM05Config,
+    *,
+    llm_attn_implementation: str | None = None,
+    vision_attn_implementation: str | None = None,
+    action_attn_implementation: str | None = None,
+) -> None:
+    """Override checkpoint attention backends before model construction."""
+    vlm_attention = config.vlm_config._attn_implementation
+    if isinstance(vlm_attention, dict):
+        vlm_attention = dict(vlm_attention)
+    elif vlm_attention is None:
+        vlm_attention = {}
+    else:
+        vlm_attention = {"": vlm_attention}
+
+    if llm_attn_implementation not in (None, "auto"):
+        vlm_attention[""] = llm_attn_implementation
+        vlm_attention["text_config"] = llm_attn_implementation
+    if vision_attn_implementation not in (None, "auto"):
+        vlm_attention["vision_config"] = vision_attn_implementation
+    config.vlm_config._attn_implementation = vlm_attention
+
+    if action_attn_implementation not in (None, "auto"):
+        config.action_config._attn_implementation = action_attn_implementation
+
+    logger.info(
+        "Configured LoRA inference attention before model construction: "
+        "LLM={}, Vision={}, Action={}",
+        llm_attn_implementation,
+        vision_attn_implementation,
+        action_attn_implementation,
+    )
+
+
 @dataclass
 class DM05LoraConfig:
     style: str = field(default="openvla_e1_alllinear_time_mod")
@@ -359,9 +394,18 @@ def load_dm05_model_for_inference(
     *,
     dtype: torch.dtype,
     trust_remote_code: bool = True,
+    llm_attn_implementation: str | None = None,
+    vision_attn_implementation: str | None = None,
+    action_attn_implementation: str | None = None,
 ) -> torch.nn.Module:
     if not _is_lora_checkpoint(model_name_or_path):
         config = _load_dm05_config_for_inference(model_name_or_path, config_overrides)
+        _apply_attention_config_for_inference(
+            config,
+            llm_attn_implementation=llm_attn_implementation,
+            vision_attn_implementation=vision_attn_implementation,
+            action_attn_implementation=action_attn_implementation,
+        )
         return DM05ForConditionalGeneration.from_pretrained(
             model_name_or_path,
             config=config,
@@ -387,6 +431,12 @@ def load_dm05_model_for_inference(
         else base_model_path
     )
     config = _load_dm05_config_for_inference(config_source, config_overrides)
+    _apply_attention_config_for_inference(
+        config,
+        llm_attn_implementation=llm_attn_implementation,
+        vision_attn_implementation=vision_attn_implementation,
+        action_attn_implementation=action_attn_implementation,
+    )
     base_model = DM05ForConditionalGeneration.from_pretrained(
         base_model_path,
         config=config,

@@ -397,6 +397,10 @@ class DM05ActionExpert(Gemma3TextModel):
 @dataclass
 class DM05OutputWithPast(Gemma3CausalLMOutputWithPast):
     fm_loss: torch.FloatTensor | None = None
+    per_action_fm: torch.FloatTensor | None = None
+    per_sample_fm: torch.FloatTensor | None = None
+    flow_time: torch.FloatTensor | None = None
+    flow_noise: torch.FloatTensor | None = None
 
 
 @dataclass
@@ -846,6 +850,9 @@ class DM05ForConditionalGeneration(DMPreTrainedModel):
         action_mask: torch.BoolTensor | None = None,
         history_pixel_values: torch.Tensor | None = None,
         history_mask: torch.BoolTensor | None = None,
+        flow_noise: torch.FloatTensor | None = None,
+        flow_time: torch.FloatTensor | None = None,
+        return_flow_details: bool = False,
         **kwargs,
     ) -> Gemma3CausalLMOutputWithPast:
         """Run the training forward pass and compute flow-matching loss."""
@@ -875,14 +882,32 @@ class DM05ForConditionalGeneration(DMPreTrainedModel):
                 action_mask = action_mask.repeat(num_flow_samples, 1, 1)
 
         # Step 2: run suffix forward for flow matching.
-        noise = torch.randn_like(action)
-        time = (
-            torch.distributions.Beta(1.5, 1.0)
-            .sample((batch_size,))
-            .to(action.device, dtype=action.dtype)
-            * 0.999
-            + 0.001
-        )
+        if flow_noise is None:
+            noise = torch.randn_like(action)
+        else:
+            if flow_noise.shape != action.shape:
+                raise ValueError(
+                    "flow_noise must match action shape, "
+                    f"got noise={flow_noise.shape}, action={action.shape}."
+                )
+            noise = flow_noise.to(device=action.device, dtype=action.dtype)
+
+        if flow_time is None:
+            time = (
+                torch.distributions.Beta(1.5, 1.0)
+                .sample((batch_size,))
+                .to(action.device, dtype=action.dtype)
+                * 0.999
+                + 0.001
+            )
+        else:
+            time = flow_time.to(device=action.device, dtype=action.dtype).reshape(-1)
+            if time.shape != (batch_size,):
+                raise ValueError(
+                    f"flow_time must have shape {(batch_size,)}, got {time.shape}."
+                )
+            if torch.any((time < 0.0) | (time > 1.0)):
+                raise ValueError("flow_time values must be in [0, 1].")
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * action
         x_t = x_t * action_mask
@@ -931,9 +956,12 @@ class DM05ForConditionalGeneration(DMPreTrainedModel):
 
         elem_mse = F.mse_loss(v_t, u_t, reduction="none")  # [B, T, D]
 
+        per_action_fm = (elem_mse * action_mask).sum(dim=-1) / action_mask.sum(
+            dim=-1
+        ).clamp_min(1)
         per_sample_fm = (elem_mse * action_mask).sum(dim=(1, 2)) / action_mask.sum(
             dim=(1, 2)
-        )
+        ).clamp_min(1)
         fm_loss = per_sample_fm.mean()
         loss = fm_loss
         if self.precision_policy == FP32_MIXED_PRECISION_POLICY:
@@ -944,6 +972,10 @@ class DM05ForConditionalGeneration(DMPreTrainedModel):
         return DM05OutputWithPast(
             loss=loss,
             fm_loss=fm_loss,
+            per_action_fm=per_action_fm,
+            per_sample_fm=per_sample_fm,
+            flow_time=time if return_flow_details else None,
+            flow_noise=noise if return_flow_details else None,
             logits=None,
             past_key_values=None,
         )
@@ -1665,6 +1697,34 @@ class DM05ForConditionalGeneration(DMPreTrainedModel):
 
         prefix_outputs = self.model.vlm.model(**model_kwargs)
         return kv_cache, prefix_outputs.last_hidden_state
+
+    @torch.no_grad()
+    def fpo_prefix_features(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor | None,
+        pixel_values: torch.Tensor | None,
+        token_type_ids: torch.LongTensor | None,
+        history_pixel_values: torch.Tensor | None = None,
+        history_mask: torch.BoolTensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return frozen observation features and their valid-token mask."""
+
+        _, prefix_hidden_states = self._compute_prefix_cache(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            token_type_ids=token_type_ids,
+            history_pixel_values=history_pixel_values,
+            history_mask=history_mask,
+            cache_cls=DynamicCache,
+        )
+        prefix_attention_mask = mask_history_pad_tokens_in_attention(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        return prefix_hidden_states.detach(), prefix_attention_mask.bool()
 
     def _extract_prefix_cache_tensors(
         self,

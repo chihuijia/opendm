@@ -178,6 +178,9 @@ class DM05ModelConfig(Config):
             config_overrides=self._config_overrides(),
             dtype=self._torch_dtype(),
             trust_remote_code=True,
+            llm_attn_implementation=self.llm_attn_implementation,
+            vision_attn_implementation=self.vision_attn_implementation,
+            action_attn_implementation=self.action_attn_implementation,
         )
 
     def _set_precision_policy(self, model: torch.nn.Module) -> None:
